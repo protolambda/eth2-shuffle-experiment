@@ -41,12 +41,6 @@ func innerShuffleList(hashFn HashFn, input []uint64, roundsPow uint8, seed [32]b
 	}
 	buf := make([]byte, hMaxSize, hMaxSize)
 	rounds := uint64(1) << roundsPow
-	r := uint64(0)
-	if !dir {
-		// Start at last round.
-		// Iterating through the rounds in reverse, un-swaps everything, effectively un-shuffling the list.
-		r = rounds - 1
-	}
 
 	// Seed is always the first 32 bytes of the hash input, we never have to change this part of the buffer.
 	copy(buf[:hSeedSize], seed[:])
@@ -69,7 +63,7 @@ func innerShuffleList(hashFn HashFn, input []uint64, roundsPow uint8, seed [32]b
 
 			// clip if there's less pivots necessary than you can get from a single hash
 			for p := uint8(0); p < 4 && rounds > uint64(p); p++ {
-				pivots[p] = binary.LittleEndian.Uint64(h[p << 3:(p + 1) << 3]) % listSize
+				pivots[(i << 2) + p] = binary.LittleEndian.Uint64(h[p << 3:(p + 1) << 3]) % listSize
 			}
 		}
 	}
@@ -82,17 +76,21 @@ func innerShuffleList(hashFn HashFn, input []uint64, roundsPow uint8, seed [32]b
 		//  and doesn't need a pair bit, it's still shuffled during different pivot choices)
 		pairs := listSize >> 1
 		widthBytes := rounds >> 3
+		// support small amount of rounds
+		if widthBytes == 0 {
+			widthBytes = 1
+		}
 		pairsPerHash := 32 / widthBytes
 		// round up amount of hashes necessary to cover every pair
 		hashes := (pairs + pairsPerHash - 1) / pairsPerHash
-		// swap-or-not, per pair. No need to zero out allocation first
-		swapOrNot = make([]byte, 0, hashes<<(8-3))
-		swapOrNot = swapOrNot[:cap(swapOrNot)]
+		// swap-or-not, per pair.
+		swapOrNot = make([]byte, hashes<<(8-3), hashes<<(8-3))
 		offset := uint64(0)
 		for i := uint64(0); i < hashes; i++ {
 			// You could expand hash input to 64 bits for (gigantic) sets of validators. 32 bits is sufficient.
 			binary.LittleEndian.PutUint32(buf[hSeedSize:hPairSize], uint32(i))
 			source := hashFn(buf)
+			//source := []byte{0x55, 0x55, 0x55, 0x55, 0x55, 0x55, 0x55, 0x55, 0x55, 0x55, 0x55, 0x55, 0x55, 0x55, 0x55, 0x55, 0x55, 0x55, 0x55, 0x55, 0x55, 0x55, 0x55, 0x55, 0x55, 0x55, 0x55, 0x55, 0x55, 0x55, 0x55, 0x55}
 			copy(swapOrNot[offset:offset+32], source)
 			offset += 32
 		}
@@ -101,14 +99,44 @@ func innerShuffleList(hashFn HashFn, input []uint64, roundsPow uint8, seed [32]b
 	output := make([]uint64, len(input), len(input))
 	for i := uint64(0); i < listSize; i++ {
 		x := i
+		r := uint64(0)
+		if !dir {
+			// Start at last round.
+			// Iterating through the rounds in reverse, un-swaps everything, effectively un-shuffling the list.
+			r = rounds - 1
+		}
 		for {
+
 			pivot := pivots[r]
-			// spec: flip = (pivot - index) % list_size
-			// Add extra list_size to prevent underflows.
+			// spec (watch out, signed math): flip = (pivot - index) % list_size
 			// "flip" will be the other side of the pair
-			flip := (pivot + (listSize - x)) % listSize
-			// ignore a mirror point that swaps with itself
-			if flip != x {
+			var flip uint64
+			var m uint64
+			if x <= pivot {
+				// flip around mirror_0
+				m = (pivot + 1) >> 1
+				if x > m {
+					// flip from right to left
+					flip = m - (x - m)
+				} else if x < m {
+					// flip from left to right
+					flip = m + (m - x) - 1
+				}
+			} else {
+				// flip around mirror_1
+				m = (pivot + listSize + 1) >> 1
+				if x > m {
+					// flip from right to left
+					flip = m - (x - m)
+				} else if x < m {
+					// flip from left to right
+					flip = m + (m - x) - 1
+				}
+			}
+
+			// if it's not flipping with itself
+			if m != x {
+
 				// lowest indexes the pairs by two series: 0...mirror_1, pivot...mirror_2
 				lowest := x
 				if flip < x {
@@ -116,8 +144,8 @@ func innerShuffleList(hashFn HashFn, input []uint64, roundsPow uint8, seed [32]b
 				}
 				// pair indexes as one consecutive series
 				pair := lowest
-				if lowest > pivot {
-					pair -= pivot / 2
+				if lowest >= pivot {
+					pair -= pivot >> 1
 					// If the pivot is odd, reduce one more
 					//  (the first mirror point swaps with itself, and is not considered a pair)
 					if pivot&1 == 1 {
@@ -127,7 +155,7 @@ func innerShuffleList(hashFn HashFn, input []uint64, roundsPow uint8, seed [32]b
 				// get the byte corresponding to this round.
 				// Simply multiple pair with the widthBytes (no need for mul op), to find the offset of the swapOrNot bytes for the given pair.
 				// Then add round/8 to determine the byte that contains the bit for the current round.
-				byteI := (pair << (roundsPow - 3)) + uint64(r >> 3)
+				byteI := (pair << (roundsPow - 3)) + uint64(r>>3)
 				byteV := swapOrNot[byteI]
 				// get the bit within the byte corresponding to this round
 				bitV := (byteV >> (r & 7)) & 1

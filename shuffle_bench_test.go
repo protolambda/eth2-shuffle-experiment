@@ -49,6 +49,27 @@ import (
 //	}
 //}
 
+func TestShuffleList(t *testing.T) {
+	listSize := uint64(400)
+
+	hashFn := getStandardHashFn()
+	// "random" seed for testing. Can be any 32 bytes.
+	seed := [32]byte{123, 42}
+
+	// rounds of shuffling, constant in spec
+	roundsPow := uint8(7)
+
+	// list to test
+	testIndices := make([]uint64, listSize, listSize)
+	// fill
+	for i := uint64(0); i < listSize; i++ {
+		testIndices[i] = i
+	}
+	fmt.Println(testIndices)
+	ShuffleList(hashFn, testIndices, roundsPow, seed)
+	fmt.Println(testIndices)
+}
+
 func BenchmarkShuffleList(b *testing.B) {
 	listSizes := []uint64{4000000, 40000, 400}
 
