@@ -78,7 +78,7 @@ func BenchmarkShuffleList(b *testing.B) {
 	seed := [32]byte{123, 42}
 
 	// rounds of shuffling, constant in spec
-	roundsPow := uint8(7)
+	roundsPow := uint8(4)
 
 	for _, listSize := range listSizes {
 		// list to test
