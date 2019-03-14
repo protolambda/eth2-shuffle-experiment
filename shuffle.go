@@ -5,36 +5,43 @@ import "encoding/binary"
 type HashFn func(input []byte) []byte
 
 const hSeedSize = int8(32)
-const hRoundSize = int8(1)
-const hPositionWindowSize = int8(4)
-const hPivotViewSize = hSeedSize + hRoundSize
-const hTotalSize = hSeedSize + hRoundSize + hPositionWindowSize
+const hPivotSize = int8(32 + 1)
+const hPairSize = int8(32 + 4)
+const hMaxSize = hPairSize
 
 
 // Shuffles the list
-func ShuffleList(hashFn HashFn, input []uint64, rounds uint8, seed [32]byte) {
-	innerShuffleList(hashFn, input, rounds, seed, true)
+func ShuffleList(hashFn HashFn, input []uint64, roundsPow uint8, seed [32]byte) {
+	innerShuffleList(hashFn, input, roundsPow, seed, true)
 }
 
 // Un-shuffles the list
-func UnshuffleList(hashFn HashFn, input []uint64, rounds uint8, seed [32]byte) {
-	innerShuffleList(hashFn, input, rounds, seed, false)
+func UnshuffleList(hashFn HashFn, input []uint64, roundsPow uint8, seed [32]byte) {
+	innerShuffleList(hashFn, input, roundsPow, seed, false)
 }
 
 // Shuffles or unshuffles, depending on the `dir` (true for shuffling, false for unshuffling
-func innerShuffleList(hashFn HashFn, input []uint64, rounds uint8, seed [32]byte, dir bool) {
+// rounds = 2**roundsPow, max roundsPow = 8
+func innerShuffleList(hashFn HashFn, input []uint64, roundsPow uint8, seed [32]byte, dir bool) {
 	if len(input) <= 1 {
 		// nothing to (un)shuffle
 		return
 	}
-	if rounds == 0 {
+	if roundsPow == 0 {
 		return
+	}
+	if roundsPow > 8 {
+		panic("too many rounds")
 	}
 	// The new version uses the inverse, to make writes nicely consecutive
 	dir = !dir
 	listSize := uint64(len(input))
-	buf := make([]byte, hTotalSize, hTotalSize)
-	r := uint8(0)
+	if listSize > uint64(1) << 32 {
+		panic("input list too large")
+	}
+	buf := make([]byte, hMaxSize, hMaxSize)
+	rounds := uint64(1) << roundsPow
+	r := uint64(0)
 	if !dir {
 		// Start at last round.
 		// Iterating through the rounds in reverse, un-swaps everything, effectively un-shuffling the list.
@@ -48,45 +55,46 @@ func innerShuffleList(hashFn HashFn, input []uint64, rounds uint8, seed [32]byte
 
 	// pre-compute the pivots
 	{
-		// Divide rounds by 4, round up the number
-		pivotHashes := (rounds + 3) / 4
+		// compute (rounds/4) hashes to derive pivots from (4 8-byte hashes per pivot, i.e. 64 bits)
+		pivotHashes := uint8(1)
+		if roundsPow > 2 {
+			pivotHashes <<= roundsPow - 2
+		}
 		for i := uint8(0); i < pivotHashes; i++ {
-			// pivot_hash_offset = 8*(round % 4)
-			// pivot = bytes_to_int(hash(seed + int_to_bytes1(round / 4))[pivot_hash_offset:pivot_hash_offset+8]) % list_size
+			// pivot = bytes_to_int(hash(seed + int_to_bytes1(i))[pivot_hash_offset:pivot_hash_offset+8]) % list_size
 			// This is the "int_to_bytes1(round)", appended to the seed.
 			buf[hSeedSize] = i
-			// compute 1 hash (32 bytes) to derive 4 pivots (each 8 bytes) from (or less, clip end)
 			// Seed is already in place, now just hash the correct part of the buffer (Seed bytes, pivot byte), and take a uint64 from it,
-			h := hashFn(buf[:hPivotViewSize])[:8]
-			for j, x := 4*i, 0; j < rounds && x < 32; j, x = j+1, x+8 {
-				// 64 bit number, no big deal to use modulo here (insignificant bias)
-				pivots[j] = binary.LittleEndian.Uint64(h[x:x+8]) % listSize
+			h := hashFn(buf[:hPivotSize])
+
+			// clip if there's less pivots necessary than you can get from a single hash
+			for p := uint8(0); p < 4 && rounds > uint64(p); p++ {
+				pivots[p] = binary.LittleEndian.Uint64(h[p << 3:(p + 1) << 3]) % listSize
 			}
 		}
 	}
 
 	// pre-compute the hashes
+	var swapOrNot []byte
 
-	// we have n/2 pairs (if odd; one of the mirror points is simply unpaired,
-	//  and doesn't need a pair bit, it's still shuffled during different pivot choices)
-	pairs := listSize / 2
-	// the number of swap-or-not bytes spent per validator
-	widthBytes := (uint64(rounds) + 7) / 8
-	pairsPerHash := 32 / widthBytes
-	if pairsPerHash == 0 {
-		panic("too many rounds")
-	}
-	// swap-or-not, per pair
-	swapOrNot := make([]byte, pairs*widthBytes, pairs*widthBytes)
-	for i := uint64(0); i < pairs; i++ {
-		// TODO: we use 64 bit nums for validator indices / pairs, yet we only consider 32 bits for the unique hash.
-		//  (same in old spec shuffling). It's unrealistic to expect more than 4M validators however, so in practice it doesn't matter
-		binary.LittleEndian.PutUint32(buf[hPivotViewSize:], uint32(i))
-		source := hashFn(buf)
-		// example, 90 rounds: 90+38, 90+38
-		for j := uint64(0); j < pairsPerHash; j++ {
-			start := j*widthBytes
-			copy(swapOrNot[i*widthBytes:], source[start:start+widthBytes])
+	{
+		// we have n/2 pairs (if odd; one of the mirror points is simply unpaired,
+		//  and doesn't need a pair bit, it's still shuffled during different pivot choices)
+		pairs := listSize >> 1
+		widthBytes := rounds >> 3
+		pairsPerHash := 32 / widthBytes
+		// round up amount of hashes necessary to cover every pair
+		hashes := (pairs + pairsPerHash - 1) / pairsPerHash
+		// swap-or-not, per pair. No need to zero out allocation first
+		swapOrNot = make([]byte, 0, hashes<<(8-3))
+		swapOrNot = swapOrNot[:cap(swapOrNot)]
+		offset := uint64(0)
+		for i := uint64(0); i < hashes; i++ {
+			// You could expand hash input to 64 bits for (gigantic) sets of validators. 32 bits is sufficient.
+			binary.LittleEndian.PutUint32(buf[hSeedSize:hPairSize], uint32(i))
+			source := hashFn(buf)
+			copy(swapOrNot[offset:offset+32], source)
+			offset += 32
 		}
 	}
 
@@ -116,8 +124,10 @@ func innerShuffleList(hashFn HashFn, input []uint64, rounds uint8, seed [32]byte
 						pair--
 					}
 				}
-				// get the byte corresponding to this round
-				byteI := (pair * widthBytes) + uint64(r/8)
+				// get the byte corresponding to this round.
+				// Simply multiple pair with the widthBytes (no need for mul op), to find the offset of the swapOrNot bytes for the given pair.
+				// Then add round/8 to determine the byte that contains the bit for the current round.
+				byteI := (pair << (roundsPow - 3)) + uint64(r >> 3)
 				byteV := swapOrNot[byteI]
 				// get the bit within the byte corresponding to this round
 				bitV := (byteV >> (r & 7)) & 1

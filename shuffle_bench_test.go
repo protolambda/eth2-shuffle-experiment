@@ -57,7 +57,7 @@ func BenchmarkShuffleList(b *testing.B) {
 	seed := [32]byte{123, 42}
 
 	// rounds of shuffling, constant in spec
-	rounds := uint8(255)
+	roundsPow := uint8(7)
 
 	for _, listSize := range listSizes {
 		// list to test
@@ -69,7 +69,7 @@ func BenchmarkShuffleList(b *testing.B) {
 		// benchmark!
 		b.Run(fmt.Sprintf("ShuffleList_%d", listSize), func(ib *testing.B) {
 			for i := 0; i < ib.N; i++ {
-				ShuffleList(hashFn, testIndices, rounds, seed)
+				ShuffleList(hashFn, testIndices, roundsPow, seed)
 			}
 		})
 	}
